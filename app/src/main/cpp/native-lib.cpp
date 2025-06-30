@@ -7,16 +7,11 @@
 #include <android/dlext.h>
 #include <sys/system_properties.h>
 #include <pthread.h>
-#include <android/dlext_namespaces.h>
 
 #include <logger.hpp>
 #include <jvmti_hooker.hpp>
-
-#define ANDROID_R_API 30
-
-extern "C" {
-    jint JNI_GetCreatedJavaVMs(JavaVM **vmBuf, jsize bufLen, jsize *nVMs);
-}
+#include <linker.hpp>
+#include <xdl.h>
 
 extern "C" JNIEXPORT jstring JNICALL
 Java_ru_x5113nc3x_jvmti_1test_MainActivity_stringFromJNI(
@@ -34,11 +29,9 @@ Java_ru_x5113nc3x_jvmti_1test_MainActivity_stringFromJNI(
 }
 
 typedef jint (*JNI_GetCreatedJavaVMs_t)(JavaVM **vmBuf, jsize bufLen, jsize *nVMs);
-// Функция для получения JavaVM через поиск символов в загруженных библиотеках
 JavaVM* findJavaVMViaSymbols() {
     
-    // Пробуем другие возможные символы
-    JNI_GetCreatedJavaVMs_t getCreatedVMs = 
+    JNI_GetCreatedJavaVMs_t getCreatedVMs =
             (JNI_GetCreatedJavaVMs_t)getSym("JNI_GetCreatedJavaVMs");
     if (getCreatedVMs) {
         JavaVM* vms[10];
@@ -55,28 +48,22 @@ JavaVM* findJavaVMViaSymbols() {
     return nullptr;
 }
 
-// Функция для получения JavaVM из любого загруженного процесса
 JavaVM* getJavaVM() {
-    // Пытаемся найти JavaVM через dlsym из libart.so
     JavaVM* vm = findJavaVMViaSymbols();
     return vm;
 }
 
-// Функция для инициализации пейлоада
 void initPayload() {
     ALOGI("=== PAYLOAD INJECTION STARTED ===");
     
-    // Получаем JavaVM
     g_vm = getJavaVM();
     if (!g_vm) {
         ALOGE("Failed to get JavaVM, payload initialization failed");
         return;
     }
     
-    // Получаем JNIEnv
     jint getEnvResult = g_vm->GetEnv((void**)&g_env, JNI_VERSION_1_6);
     if (getEnvResult == JNI_EDETACHED) {
-        // Поток не привязан к VM, привязываем
         if (g_vm->AttachCurrentThread(&g_env, nullptr) != JNI_OK) {
             ALOGE("Failed to attach current thread to VM");
             return;
@@ -86,65 +73,48 @@ void initPayload() {
         ALOGE("Failed to get JNIEnv: %d", getEnvResult);
         return;
     }
-    
-    // Получаем API level
-    api_level = getAndroidApiLevel();
-    ALOGI("Android API Level: %d", api_level);
-    
-    // Получаем путь к текущей библиотеке
-    std::string currentLibPath = getCurrentLibraryPath();
-    if (!currentLibPath.empty()) {
-        ALOGI("Current library path: %s", currentLibPath.c_str());
-        
-        // Подключаем себя как JVMTI агент
-        attachJvmtiAgent(g_vm, g_env, currentLibPath);
-    } else {
-        ALOGE("Failed to get current library path");
-    }
-    
-    // Инициализируем ART хуки
-    const char* ArtLibPath = nullptr;
-    if (fileExists("/apex/com.android.art/lib64/libart.so")) {
-        ArtLibPath = "/apex/com.android.art/lib64/libart.so";
-    } else if (fileExists("/system/lib64/libart.so")) {
-        ArtLibPath = "/system/lib64/libart.so";
-    } else {
-        ALOGE("ART library not found");
-        return;
-    }
-    
-    ALOGI("Using ART library: %s", ArtLibPath);
-    
-    // Устанавливаем флаги отладки
+
+
     auto SetJdwpAllowed = reinterpret_cast<void (*)(bool)>(
-        getSym("_ZN3art3Dbg14SetJdwpAllowedEb"));
+            getSym("_ZN3art3Dbg14SetJdwpAllowedEb"));
     if (SetJdwpAllowed != nullptr) {
         SetJdwpAllowed(true);
         ALOGI("SetJdwpAllowed(true) called");
     } else {
         ALOGW("SetJdwpAllowed function not found");
     }
-    
-    // Получаем runtime из JavaVM
+
     struct JavaVMExt {
         void* functions;
         void* runtime;
     };
-    
+
     JavaVMExt* javaVMExt = (JavaVMExt*)g_vm;
     void* runtime = javaVMExt->runtime;
-    
+
     if (runtime != nullptr) {
-        auto setJavaDebuggable = reinterpret_cast<void (*)(void*, bool)>(
-            getSym("_ZN3art7Runtime17SetJavaDebuggableEb"));
+        auto setJavaDebuggable = reinterpret_cast<void (*)(void*, unsigned char)>(
+                getSym("_ZN3art7Runtime20SetRuntimeDebugStateENS0_17RuntimeDebugStateE"));
         if (setJavaDebuggable != nullptr) {
-            setJavaDebuggable(runtime, true);
-            ALOGI("setJavaDebuggable(true) called");
+            setJavaDebuggable(runtime, 2);
+            ALOGI("_ZN3art7Runtime20SetRuntimeDebugStateENS0_17RuntimeDebugStateE(true) called");
         } else {
             ALOGW("setJavaDebuggable function not found");
         }
     } else {
         ALOGW("Runtime pointer is null");
+    }
+    
+    api_level = getAndroidApiLevel();
+    ALOGI("Android API Level: %d", api_level);
+    
+    std::string currentLibPath = getCurrentLibraryPath();
+    if (!currentLibPath.empty()) {
+        ALOGI("Current library path: %s", currentLibPath.c_str());
+        
+        attachJvmtiAgent(g_vm, g_env, "/data/data/ru.x5113nc3x.jvmti_test/cache/libjvmti_test.so");
+    } else {
+        ALOGE("Failed to get current library path");
     }
     
     ALOGI("=== PAYLOAD INJECTION COMPLETED ===");
@@ -154,16 +124,13 @@ void initPayload() {
 __attribute__((constructor))
 void onLibraryLoad() {
     ALOGI("Library loaded as payload!");
-    
-    // Запускаем инициализацию в отдельном потоке для избежания блокировок
     pthread_t thread;
     pthread_create(&thread, nullptr, [](void*) -> void* {
-        // Небольшая задержка для стабилизации процесса
         usleep(100000); // 100ms
         initPayload();
         return nullptr;
     }, nullptr);
-    
+
     pthread_detach(thread);
 }
 
@@ -171,7 +138,7 @@ void onLibraryLoad() {
 __attribute__((destructor))
 void onLibraryUnload() {
     ALOGI("Library unloaded");
-    
+
     if (g_env && g_vm) {
         // Отвязываем поток если он был привязан
         g_vm->DetachCurrentThread();
@@ -260,29 +227,32 @@ bool fileExists(const char *path) {
     return (access(path, F_OK) == 0);
 }
 
-// Получение символа из указанной библиотеки
-void* getSym(const char* sym) {
-    const android_dlextinfo dlextinfo = {
-        .flags = ANDROID_DLEXT_USE_NAMESPACE,
-        .library_namespace = android_get_exported_namespace("art")
-    };
-
-    void* handle = android_dlopen_ext("/apex/com.android.art/lib64/libart.so", RTLD_NOW, &dlextinfo);
+void* getSym(const char* name) {
+    static void* handle = nullptr;
     if (!handle) {
-        ALOGE("dlopen error: %s", dlerror());
+        handle = xdl_open("libart.so", RTLD_NOW);
+        if (!handle) {
+            handle = xdl_open("/apex/com.android.art/lib64/libart.so", RTLD_NOW);
+        }
+        if (!handle) {
+            ALOGE("dlopen libart.so failed: %s", dlerror());
+            return nullptr;
+        }
+    }
+
+    dlerror();
+
+    size_t symbol_size = 0;
+    void* sym = xdl_sym(handle, name, &symbol_size);
+    const char* err = dlerror();
+    if (err) {
+        ALOGE("dlsym(%s) failed: %s", name, err);
         return nullptr;
     }
-    void* symbol = dlsym(handle, sym);
-    if (!symbol) {
-        ALOGE("dlsym error: %s", dlerror());
-    }
-    // Не закрываем handle, чтобы символ остался валидным
-    return symbol;
+    return sym;
 }
 
-// Функция для извлечения библиотеки из APK
 std::string extractLibraryFromApk(JNIEnv* env, const std::string& apkPath, const std::string& libName) {
-    // Получаем директорию кэша приложения
     jclass contextClass = env->FindClass("android/app/ActivityThread");
     if (!contextClass) return "";
     
@@ -318,13 +288,11 @@ std::string extractLibraryFromApk(JNIEnv* env, const std::string& apkPath, const
     std::string extractedLibPath = std::string(cacheDirStr) + "/" + libName;
     env->ReleaseStringUTFChars(cacheDirPath, cacheDirStr);
     
-    // Проверяем, существует ли уже извлечённая библиотека
     if (access(extractedLibPath.c_str(), F_OK) == 0) {
         ALOGI("Library already extracted: %s", extractedLibPath.c_str());
         return extractedLibPath;
     }
     
-    // Извлекаем библиотеку из APK
     jclass zipFileClass = env->FindClass("java/util/zip/ZipFile");
     if (!zipFileClass) return "";
     
@@ -351,7 +319,6 @@ std::string extractLibraryFromApk(JNIEnv* env, const std::string& apkPath, const
     jobject inputStream = env->CallObjectMethod(zipFile, getInputStream, entry);
     if (!inputStream) return "";
     
-    // Создаём файл для извлечённой библиотеки
     jclass fileOutputStreamClass = env->FindClass("java/io/FileOutputStream");
     if (!fileOutputStreamClass) return "";
     
@@ -364,7 +331,6 @@ std::string extractLibraryFromApk(JNIEnv* env, const std::string& apkPath, const
         fileOutputStreamConstructor, extractedPathStr);
     if (!outputStream) return "";
     
-    // Копируем данные
     jclass inputStreamClass = env->GetObjectClass(inputStream);
     jmethodID read = env->GetMethodID(inputStreamClass, "read", "([B)I");
     jclass outputStreamClass = env->GetObjectClass(outputStream);
@@ -385,7 +351,6 @@ std::string extractLibraryFromApk(JNIEnv* env, const std::string& apkPath, const
         env->DeleteLocalRef(buffer);
     }
     
-    // Очищаем ресурсы
     env->DeleteLocalRef(apkPathStr);
     env->DeleteLocalRef(entryNameStr);
     env->DeleteLocalRef(extractedPathStr);
@@ -398,7 +363,6 @@ std::string extractLibraryFromApk(JNIEnv* env, const std::string& apkPath, const
     return extractedLibPath;
 }
 
-// Функция для получения пути к APK
 std::string getApkPath(JNIEnv* env) {
     jclass contextClass = env->FindClass("android/app/ActivityThread");
     if (!contextClass) return "";
@@ -432,15 +396,12 @@ std::string getApkPath(JNIEnv* env) {
     return result;
 }
 
-// Функция для подключения агента
 void attachJvmtiAgent(JavaVM* vm, JNIEnv* env, const std::string& agentPath) {
     jclass debugClass = nullptr;
     jmethodID attachMethod = nullptr;
     
-    // Получаем версию Android API
     int apiLevel = getAndroidApiLevel();
     
-    // Если библиотека внутри APK, извлекаем её
     std::string finalAgentPath = agentPath;
     if (agentPath.find(".apk!") != std::string::npos) {
         std::string apkPath = getApkPath(env);
@@ -457,7 +418,6 @@ void attachJvmtiAgent(JavaVM* vm, JNIEnv* env, const std::string& agentPath) {
     }
     
     if (apiLevel >= 28) { // Android P и выше
-        // Используем Debug.attachJvmtiAgent
         debugClass = env->FindClass("android/os/Debug");
         if (debugClass != nullptr) {
             attachMethod = env->GetStaticMethodID(debugClass, "attachJvmtiAgent", 
@@ -466,7 +426,6 @@ void attachJvmtiAgent(JavaVM* vm, JNIEnv* env, const std::string& agentPath) {
                 jstring jAgentPath = env->NewStringUTF(finalAgentPath.c_str());
                 jobject classLoader = nullptr;
                 
-                // Получаем ClassLoader
                 jclass contextClass = env->FindClass("android/app/ActivityThread");
                 if (contextClass) {
                     jmethodID currentActivityThread = env->GetStaticMethodID(contextClass, 
@@ -497,7 +456,6 @@ void attachJvmtiAgent(JavaVM* vm, JNIEnv* env, const std::string& agentPath) {
             }
         }
     } else {
-        // Используем VMDebug.attachAgent для более старых версий
         debugClass = env->FindClass("dalvik/system/VMDebug");
         if (debugClass != nullptr) {
             attachMethod = env->GetStaticMethodID(debugClass, "attachAgent", "(Ljava/lang/String;)V");
@@ -516,58 +474,3 @@ void attachJvmtiAgent(JavaVM* vm, JNIEnv* env, const std::string& agentPath) {
         ALOGE("Failed to attach JVMTI agent");
     }
 }
-
-// JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-//     ALOGI("library load");
-//     char api_level_str[5];
-//     __system_property_get("ro.build.version.sdk", api_level_str);
-//     api_level = atoi(api_level_str);
-//     JNIEnv *env = NULL;
-
-//     if (vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK) {
-//         return -1;
-//     }
-
-//     // Получаем путь к текущей библиотеке
-//     std::string currentLibPath = getCurrentLibraryPath();
-//     if (!currentLibPath.empty()) {
-//         ALOGI("Current library path: %s", currentLibPath.c_str());
-        
-//         // Подключаем себя как JVMTI агент
-//         attachJvmtiAgent(vm, env, currentLibPath);
-//     } else {
-//         ALOGE("Failed to get current library path");
-//     }
-
-//     JavaVMExt* javaVMExt = (JavaVMExt*)vm;
-
-//     void* runtime = javaVMExt->runtime;
-//     if (runtime == nullptr) {
-//         return JNI_ERR;
-//     }
-
-//     const char* ArtLibPath = nullptr;
-//     if (fileExists("/apex/com.android.art/lib64/libart.so")) {
-//         ArtLibPath = "/apex/com.android.art/lib64/libart.so";
-//     } else {
-//         ArtLibPath = "/system/lib64/libart.so";
-//     }
-//     ALOGI("artlib: %s", ArtLibPath);
-
-//     // Получение адреса функции SetJdwpAllowed и вызов её
-//     auto SetJdwpAllowed = reinterpret_cast<void (*)(bool)>(SandGetSym(ArtLibPath,
-//                                                                       "_ZN3art3Dbg14SetJdwpAllowedEb"));
-//     if (SetJdwpAllowed != nullptr) {
-//         SetJdwpAllowed(true);
-//     }
-
-//     // Получение адреса функции setJavaDebuggable и установка флага
-//     auto setJavaDebuggable = reinterpret_cast<void (*)(void*, bool)>(SandGetSym(ArtLibPath,
-//                                                                                 "_ZN3art7Runtime17SetJavaDebuggableEb"));
-//     if (setJavaDebuggable != nullptr) {
-//         setJavaDebuggable(runtime, true);
-//         ALOGE("zxw %s", "setJavaDebuggable true");
-//     }
-
-//     return JNI_VERSION_1_6;
-// }

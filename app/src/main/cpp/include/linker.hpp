@@ -1,34 +1,36 @@
-#pragma once
+#include <android/log.h>
+#include <dlfcn.h>
+#include <link.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <string>
+#include <cstring>
+#include <errno.h>
 
-#include <linker/linker_namespaces.h>
-#include <elf.h>
+#include <logger.hpp>
 
-typedef Elf32_Half Elf32_Versym;
-typedef Elf64_Half Elf64_Versym;
-typedef Elf32_Word Elf32_Relr;
-typedef Elf64_Xword Elf64_Relr;
+// Android-specific linker name
+#ifdef __LP64__
+#define LINKER_NAME "linker64"
+#else
+#define LINKER_NAME "linker"
+#endif
 
-#include <linker/linker_soinfo.h>
+// ELF structures for both 32 and 64-bit
+#if defined(__LP64__)
+#define Elf_(type) Elf64_##type
+#else
+#define Elf_(type) Elf32_##type
+#endif
 
-using get_soname_t            = const char* (*)(soinfo*);
-using get_primary_namespace_t = android_namespace_t* (*)(soinfo*);
-
-struct module_t {
-public:
-    std::string name;
-    std::unique_ptr<Binary> bin;
+// Структура для хранения информации о линкере
+struct linker_info {
     uintptr_t base;
-
-public:
-    uintptr_t get_address(const std::string& symname) {
-        if (not this->bin->has_symbol(symname)) {
-            return 0;
-        }
-        Symbol& sym = reinterpret_cast<Symbol&>(this->bin->get_symbol(symname));
-        return this->base + sym.value();
-    }
-
-    operator bool() {
-        return this->bin != nullptr;
-    }
+    const char* path;
+    bool found;
 };
+
+typedef void* (*dlopen_func)(const char*, int, const void*);
+
+extern "C" void* unrestricted_dlopen(const char* libname, int flags);

@@ -11,6 +11,8 @@ cmake_minimum_required(VERSION 3.22.1)
 # build script scope).
 project("jvmti_test")
 
+#find_package(xdl REQUIRED CONFIG)
+
 # Creates and names a library, sets it as either STATIC
 # or SHARED, and provides the relative paths to its source code.
 # You can define multiple libraries, and CMake builds them for you.
@@ -24,17 +26,23 @@ project("jvmti_test")
 # System.loadLibrary() and pass the name of the library defined here;
 # for GameActivity/NativeActivity derived applications, the same library name must be
 # used in the AndroidManifest.xml file.
+file(GLOB XDL_SRC *.c)
+
 add_library(${CMAKE_PROJECT_NAME} SHARED
         # List C/C++ source files with relative paths to this CMakeLists.txt.
         native-lib.cpp
         globals.cpp
-        linker.cpp)
+        linker.cpp
+        ${XDL_SRC}
+)
 
 target_include_directories(${CMAKE_PROJECT_NAME}
         # Specifies a path to search for header files.
         # The path is relative to this CMakeLists.txt file.
         PRIVATE
-        ${CMAKE_SOURCE_DIR}/include)
+        ${CMAKE_SOURCE_DIR}/include
+        .
+)
 
 # Specifies libraries CMake should link to your target library. You
 # can link libraries from various origins, such as libraries defined in this
@@ -44,4 +52,5 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         android
         log
         dl
-        jnigraphics)
+        jnigraphics
+        )
